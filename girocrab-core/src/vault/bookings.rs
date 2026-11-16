@@ -733,7 +733,7 @@ impl Vault {
 }
 
 /// `filter` has parts SQL can't apply: they need each booking's flow or merchant.
-fn filters_by_class(filter: &BookingFilter) -> bool {
+pub(crate) fn filters_by_class(filter: &BookingFilter) -> bool {
     filter.scope != BookingScope::All || filter.merchant_key.is_some() || filter.uncategorized_only
 }
 
@@ -847,6 +847,37 @@ impl Vault {
 
     pub fn list_transactions(&self, filter: BookingFilter) -> Result<BookingPage, CoreError> {
         self.list_page(filter, true)
+    }
+}
+
+impl Vault {
+    /// `(booking id, KPI share)` of every booking `filter` keeps, the parts SQL can't
+    /// apply (`keeps`) taken from `booking_classes`; for aggregates over a filter that
+    /// `filters_by_class` (tag totals, #228).
+    pub(crate) fn kept_shares(
+        &self,
+        db: &rusqlite::Connection,
+        filter: &BookingFilter,
+    ) -> Result<Vec<(i64, i64)>, CoreError> {
+        let classes = self.booking_classes(db)?;
+        let (cte, where_sql, args, share_sql) = Self::filter_clauses(db, filter)?;
+        let sql = format!("{cte}SELECT t.id, {share_sql} {BOOKING_FROM_SQL} WHERE {where_sql}");
+        let mut stmt = db.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args.iter().map(|b| b.as_ref())), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, share) = row?;
+            // the classes cover every live booking of this connection's data
+            if classes
+                .get(&id)
+                .is_some_and(|c| keeps(filter, c.flow, &c.merchant))
+            {
+                out.push((id, share));
+            }
+        }
+        Ok(out)
     }
 }
 
