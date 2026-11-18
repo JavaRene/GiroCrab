@@ -9,6 +9,7 @@ use girocrab_core::local_api::server::LocalApiServer;
 use girocrab_core::local_api::{ShareScope, API_VERSION};
 use girocrab_core::Vault;
 use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -157,14 +158,11 @@ fn the_apps_connection_limit_is_waited_out() {
     let dir = ShortDir::new();
     let app = serve(&dir);
     // Other programs hold every connection the app allows (MAX_CLIENTS = 4 in
-    // the core's server.rs).
-    let hold = || -> Vec<UnixStream> {
-        let held = (0..4)
-            .map(|_| UnixStream::connect(&app.socket).unwrap())
-            .collect();
-        std::thread::sleep(Duration::from_millis(200));
-        held
-    };
+    // the core's server.rs). Each one is confirmed by an answered request
+    // instead of a fixed sleep: the server frees a slot only once it has seen
+    // a closed connection, so on a slow machine a connection of an earlier
+    // step can still count and a new one is turned away with `busy`.
+    let hold = || -> Vec<UnixStream> { (0..4).map(|_| hold_a_slot(&app)).collect() };
     let held = hold();
     let release = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(400));
@@ -183,6 +181,30 @@ fn the_apps_connection_limit_is_waited_out() {
     let err = mcp.request("info", json!({})).unwrap_err();
     assert!(err.message.contains("busy"), "{}", err.message);
     app.server.stop();
+}
+
+/// A connection that holds one of the app's slots: the app answered a request
+/// on it (a connection over the limit only gets `busy` and is closed). Asks
+/// again on a fresh connection while the app is still full.
+fn hold_a_slot(app: &App) -> UnixStream {
+    let request = json!({ "v": API_VERSION, "token": app.token, "method": "info", "params": {} });
+    let give_up = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let stream = UnixStream::connect(&app.socket).unwrap();
+        writeln!(&stream, "{request}").unwrap();
+        let mut answer = String::new();
+        BufReader::new(&stream).read_line(&mut answer).unwrap();
+        let answer: Value = serde_json::from_str(&answer).unwrap();
+        if answer.get("result").is_some() {
+            return stream;
+        }
+        assert_eq!(answer["error"]["code"], "busy", "{answer}");
+        assert!(
+            std::time::Instant::now() < give_up,
+            "no slot freed within 10 s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// `girocrab-mcp --check`, as the app's settings pane runs it.
